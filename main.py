@@ -1,1014 +1,1024 @@
+# streamlit_app.py - Complete Facebook Message Bot with Streamlit UI (NO AUTO-RERUN)
+# All original functionality preserved - Browser restart every 3 hours, hard kill, auto-resume
+
 import streamlit as st
-import streamlit.components.v1 as components
-import time
-import threading
-import uuid
-import hashlib
 import os
-import subprocess
+import sys
+import time
 import json
-import urllib.parse
+import random
+import sqlite3
+import threading
+import gc
+import subprocess
+import hashlib
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+from dataclasses import dataclass
+from collections import deque
+from contextlib import contextmanager
+
+from cryptography.fernet import Fernet
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options
-import database as db
-import requests
+from selenium.webdriver.chrome.service import Service
 
+# ==================== CONFIGURATION ====================
+MAX_TASKS = 50
+BROWSER_RESTART_HOURS = 3
+
+# Data directory for persistence
+DATA_DIR = Path('/app/data') if os.path.exists('/app') else Path(__file__).parent / 'data'
+DATA_DIR.mkdir(exist_ok=True)
+
+DB_PATH = DATA_DIR / 'bot_data.db'
+ENCRYPTION_KEY_FILE = DATA_DIR / '.encryption_key'
+
+# ==================== HARD KILL FUNCTION ====================
+def hard_kill_all_chromium(task_id: str = ""):
+    """Force kill ALL chromium processes - minimal wait"""
+    try:
+        subprocess.run(['pkill', '-9', '-f', 'chromium'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        subprocess.run(['pkill', '-9', '-f', 'chromedriver'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        subprocess.run(['pkill', '-9', '-f', 'chrome'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        subprocess.run(['rm', '-rf', '/dev/shm/.org.chromium*'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        time.sleep(1)
+        if task_id:
+            log_message(task_id, "🔪 Hard kill completed")
+    except:
+        pass
+
+# ==================== LOGGING ====================
+def log_message(task_id: str, msg: str):
+    timestamp = time.strftime("%H:%M:%S")
+    formatted_msg = f"[{timestamp}] {msg}"
+    
+    if 'task_logs' not in st.session_state:
+        st.session_state.task_logs = {}
+    
+    if task_id not in st.session_state.task_logs:
+        st.session_state.task_logs[task_id] = deque(maxlen=100)
+    
+    st.session_state.task_logs[task_id].append(formatted_msg)
+    print(formatted_msg)
+
+# ==================== ENCRYPTION ====================
+def get_encryption_key():
+    if ENCRYPTION_KEY_FILE.exists():
+        with open(ENCRYPTION_KEY_FILE, 'rb') as f:
+            return f.read()
+    else:
+        key = Fernet.generate_key()
+        with open(ENCRYPTION_KEY_FILE, 'wb') as f:
+            f.write(key)
+        return key
+
+ENCRYPTION_KEY = get_encryption_key()
+cipher_suite = Fernet(ENCRYPTION_KEY)
+
+def encrypt_data(data):
+    if not data:
+        return None
+    return cipher_suite.encrypt(data.encode()).decode()
+
+def decrypt_data(encrypted_data):
+    if not encrypted_data:
+        return ""
+    try:
+        return cipher_suite.decrypt(encrypted_data.encode()).decode()
+    except:
+        return ""
+
+# ==================== DATABASE ====================
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('PRAGMA journal_mode=WAL')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS tasks (
+            task_id TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            cookies_encrypted TEXT,
+            chat_id TEXT,
+            name_prefix TEXT,
+            messages TEXT,
+            delay INTEGER DEFAULT 30,
+            status TEXT DEFAULT 'stopped',
+            messages_sent INTEGER DEFAULT 0,
+            rotation_index INTEGER DEFAULT 0,
+            last_browser_restart TIMESTAMP,
+            start_time TIMESTAMP,
+            last_active TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    cursor.execute('SELECT * FROM users WHERE username = "admin"')
+    if not cursor.fetchone():
+        password_hash = hashlib.sha256("admin123".encode()).hexdigest()
+        cursor.execute('INSERT INTO users (username, password_hash) VALUES (?, ?)', 
+                      ('admin', password_hash))
+    
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ==================== TASK CLASS ====================
+@dataclass
+class Task:
+    task_id: str
+    username: str
+    cookies: List[str]
+    chat_id: str
+    name_prefix: str
+    messages: List[str]
+    delay: int
+    status: str
+    messages_sent: int
+    start_time: Optional[datetime]
+    last_active: Optional[datetime]
+    last_browser_restart: Optional[datetime]
+    running: bool = False
+    stop_flag: bool = False
+    rotation_index: int = 0
+    
+    def get_uptime(self):
+        if not self.start_time:
+            return "00:00:00"
+        delta = datetime.now() - self.start_time
+        days = delta.days
+        hours = delta.seconds // 3600
+        minutes = (delta.seconds % 3600) // 60
+        seconds = delta.seconds % 60
+        if days > 0:
+            return f"{days}d {hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+# ==================== TASK MANAGER ====================
+class TaskManager:
+    def __init__(self):
+        self.tasks: Dict[str, Task] = {}
+        self.task_threads: Dict[str, threading.Thread] = {}
+        self.load_tasks_from_db()
+        self.start_auto_resume()
+    
+    def load_tasks_from_db(self):
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM tasks')
+        for row in cursor.fetchall():
+            try:
+                cookies = json.loads(decrypt_data(row[2])) if row[2] else []
+                messages = json.loads(decrypt_data(row[5])) if row[5] else []
+                
+                task = Task(
+                    task_id=row[0],
+                    username=row[1],
+                    cookies=cookies,
+                    chat_id=row[3] or "",
+                    name_prefix=row[4] or "",
+                    messages=messages,
+                    delay=row[6] or 30,
+                    status=row[7] or "stopped",
+                    messages_sent=row[8] or 0,
+                    start_time=datetime.fromisoformat(row[11]) if row[11] else None,
+                    last_active=datetime.fromisoformat(row[12]) if row[12] else None,
+                    last_browser_restart=datetime.fromisoformat(row[10]) if row[10] else None,
+                    rotation_index=row[9] or 0
+                )
+                self.tasks[task.task_id] = task
+                if task.status == "running":
+                    self.start_task(task.task_id)
+            except Exception as e:
+                print(f"Error loading task: {e}")
+        conn.close()
+    
+    def save_task(self, task: Task):
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO tasks 
+            (task_id, username, cookies_encrypted, chat_id, name_prefix, messages, 
+             delay, status, messages_sent, rotation_index, last_browser_restart, start_time, last_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            task.task_id,
+            task.username,
+            encrypt_data(json.dumps(task.cookies)),
+            task.chat_id,
+            task.name_prefix,
+            encrypt_data(json.dumps(task.messages)),
+            task.delay,
+            task.status,
+            task.messages_sent,
+            task.rotation_index,
+            task.last_browser_restart.isoformat() if task.last_browser_restart else None,
+            task.start_time.isoformat() if task.start_time else None,
+            task.last_active.isoformat() if task.last_active else None
+        ))
+        conn.commit()
+        conn.close()
+    
+    def delete_task(self, task_id: str):
+        if task_id in self.tasks:
+            self.stop_task(task_id)
+            del self.tasks[task_id]
+            if 'task_logs' in st.session_state and task_id in st.session_state.task_logs:
+                del st.session_state.task_logs[task_id]
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM tasks WHERE task_id = ?', (task_id,))
+            conn.commit()
+            conn.close()
+            return True
+        return False
+    
+    def start_task(self, task_id: str):
+        if task_id not in self.tasks:
+            return False
+        task = self.tasks[task_id]
+        if task.status == "running":
+            return False
+        
+        log_message(task_id, "🔥 Initial hard kill - cleaning memory...")
+        hard_kill_all_chromium(task_id)
+        time.sleep(2)
+        
+        if len([t for t in self.tasks.values() if t.status == "running"]) >= MAX_TASKS:
+            return False
+        task.status = "running"
+        task.stop_flag = False
+        if not task.start_time:
+            task.start_time = datetime.now()
+        if not task.last_browser_restart:
+            task.last_browser_restart = datetime.now()
+        task.last_active = datetime.now()
+        self.save_task(task)
+        
+        thread = threading.Thread(target=self._run_task, args=(task_id,), daemon=True)
+        thread.start()
+        self.task_threads[task_id] = thread
+        return True
+    
+    def stop_task(self, task_id: str):
+        if task_id not in self.tasks:
+            return False
+        task = self.tasks[task_id]
+        task.stop_flag = True
+        task.status = "stopped"
+        task.last_active = datetime.now()
+        self.save_task(task)
+        return True
+    
+    def start_auto_resume(self):
+        def auto_resume():
+            while True:
+                try:
+                    for task_id, task in self.tasks.items():
+                        if task.status == "running" and not task.running:
+                            log_message(task_id, f"🔄 Auto-resume: Task dead, restarting...")
+                            hard_kill_all_chromium(task_id)
+                            self.start_task(task_id)
+                except Exception as e:
+                    print(f"Auto resume error: {e}")
+                time.sleep(60)
+        
+        thread = threading.Thread(target=auto_resume, daemon=True)
+        thread.start()
+        print("✅ Auto-resume thread started")
+    
+    def _setup_browser(self, task_id: str):
+        chrome_options = Options()
+        chrome_options.add_argument('--headless=new')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-setuid-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--disable-extensions')
+        chrome_options.add_argument('--disable-plugins')
+        chrome_options.add_argument('--window-size=1280,720')
+        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36')
+        
+        chrome_options.add_argument('--memory-pressure-off')
+        chrome_options.add_argument('--max_old_space_size=128')
+        chrome_options.add_argument('--js-flags="--max-old-space-size=128"')
+        
+        chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
+        chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+        
+        chromium_paths = [
+            '/usr/bin/chromium',
+            '/usr/bin/chromium-browser',
+            '/usr/bin/google-chrome',
+            '/usr/bin/chrome'
+        ]
+        
+        for chromium_path in chromium_paths:
+            if Path(chromium_path).exists():
+                chrome_options.binary_location = chromium_path
+                log_message(task_id, f'Found Chromium at: {chromium_path}')
+                break
+        
+        chromedriver_paths = [
+            '/usr/bin/chromedriver',
+            '/usr/local/bin/chromedriver'
+        ]
+        
+        driver_path = None
+        for driver_candidate in chromedriver_paths:
+            if Path(driver_candidate).exists():
+                driver_path = driver_candidate
+                log_message(task_id, f'Found ChromeDriver at: {driver_path}')
+                break
+        
+        try:
+            if driver_path:
+                service = Service(executable_path=driver_path)
+                driver = webdriver.Chrome(service=service, options=chrome_options)
+                log_message(task_id, 'Chrome started with detected ChromeDriver!')
+            else:
+                driver = webdriver.Chrome(options=chrome_options)
+                log_message(task_id, 'Chrome started with default driver!')
+            
+            driver.set_window_size(1280, 720)
+            log_message(task_id, 'Chrome browser setup completed successfully!')
+            return driver
+            
+        except Exception as error:
+            log_message(task_id, f'Browser setup failed: {error}')
+            try:
+                from webdriver_manager.chrome import ChromeDriverManager
+                log_message(task_id, 'Trying webdriver-manager...')
+                service = Service(ChromeDriverManager().install())
+                driver = webdriver.Chrome(service=service, options=chrome_options)
+                log_message(task_id, 'Chrome started with webdriver-manager!')
+                return driver
+            except Exception as e:
+                log_message(task_id, f'All browser setups failed: {e}')
+                raise error
+    
+    def _find_message_input(self, driver, task_id: str, process_id: str):
+        log_message(task_id, f"{process_id}: Finding message input...")
+        
+        try:
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(2)
+            driver.execute_script("window.scrollTo(0, 0);")
+            time.sleep(2)
+        except Exception:
+            pass
+        
+        message_input_selectors = [
+            'div[contenteditable="true"][role="textbox"]',
+            'div[contenteditable="true"][data-lexical-editor="true"]',
+            'div[aria-label*="message" i][contenteditable="true"]',
+            'div[aria-label*="Message" i][contenteditable="true"]',
+            'div[contenteditable="true"][spellcheck="true"]',
+            '[role="textbox"][contenteditable="true"]',
+            'textarea[placeholder*="message" i]',
+            'div[aria-placeholder*="message" i]',
+            'div[data-placeholder*="message" i]',
+            '[contenteditable="true"]',
+            'textarea',
+            'input[type="text"]'
+        ]
+        
+        for idx, selector in enumerate(message_input_selectors):
+            try:
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                for element in elements:
+                    try:
+                        is_editable = driver.execute_script("""
+                            return arguments[0].contentEditable === 'true' || 
+                                   arguments[0].tagName === 'TEXTAREA' || 
+                                   arguments[0].tagName === 'INPUT';
+                        """, element)
+                        
+                        if is_editable:
+                            try:
+                                element.click()
+                                time.sleep(0.5)
+                            except:
+                                pass
+                            
+                            element_text = driver.execute_script("return arguments[0].placeholder || arguments[0].getAttribute('aria-label') || arguments[0].getAttribute('aria-placeholder') || '';", element).lower()
+                            
+                            keywords = ['message', 'write', 'type', 'send', 'chat', 'msg', 'reply', 'text', 'aa']
+                            if any(keyword in element_text for keyword in keywords):
+                                log_message(task_id, f"{process_id}: ✅ Found message input")
+                                return element
+                            elif idx < 10:
+                                log_message(task_id, f"{process_id}: Using primary selector editable element")
+                                return element
+                            elif selector == '[contenteditable="true"]' or selector == 'textarea' or selector == 'input[type="text"]':
+                                log_message(task_id, f"{process_id}: Using fallback editable element")
+                                return element
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        
+        log_message(task_id, f"{process_id}: ❌ Message input not found!")
+        return None
+    
+    def _login_and_navigate(self, driver, task: Task, task_id: str, process_id: str):
+        log_message(task_id, f"{process_id}: Loading Facebook homepage...")
+        driver.get('https://www.facebook.com/')
+        time.sleep(8)
+        
+        current_cookie = task.cookies[0] if task.cookies else ""
+        if current_cookie and current_cookie.strip():
+            log_message(task_id, f"{process_id}: Adding cookies...")
+            cookie_array = current_cookie.split(';')
+            for cookie in cookie_array:
+                cookie_trimmed = cookie.strip()
+                if cookie_trimmed and '=' in cookie_trimmed:
+                    name, value = cookie_trimmed.split('=', 1)
+                    try:
+                        driver.add_cookie({
+                            'name': name.strip(),
+                            'value': value.strip(),
+                            'domain': '.facebook.com',
+                            'path': '/'
+                        })
+                    except:
+                        pass
+            driver.refresh()
+            time.sleep(5)
+        
+        if task.chat_id:
+            log_message(task_id, f"{process_id}: Opening conversation {task.chat_id}...")
+            driver.get(f'https://www.facebook.com/messages/t/{task.chat_id.strip()}')
+        else:
+            log_message(task_id, f"{process_id}: Opening messages...")
+            driver.get('https://www.facebook.com/messages')
+        
+        time.sleep(12)
+        
+        message_input = self._find_message_input(driver, task_id, process_id)
+        
+        if not message_input:
+            log_message(task_id, f"{process_id}: Input not found, waiting additional 5 seconds...")
+            time.sleep(5)
+            message_input = self._find_message_input(driver, task_id, process_id)
+        
+        return message_input
+    
+    def _send_single_message(self, driver, message_input, task: Task, task_id: str, process_id: str):
+        messages_list = [msg.strip() for msg in task.messages if msg.strip()]
+        if not messages_list:
+            messages_list = ['Hello!']
+        
+        msg_idx = task.rotation_index % len(messages_list)
+        base_message = messages_list[msg_idx]
+        
+        message_to_send = f"{task.name_prefix} {base_message}" if task.name_prefix else base_message
+        
+        try:
+            driver.execute_script("""
+                const element = arguments[0];
+                const message = arguments[1];
+                
+                element.scrollIntoView({behavior: 'smooth', block: 'center'});
+                element.focus();
+                element.click();
+                
+                if (element.tagName === 'DIV') {
+                    element.textContent = message;
+                    element.innerHTML = message;
+                } else {
+                    element.value = message;
+                }
+                
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+                element.dispatchEvent(new InputEvent('input', { bubbles: true, data: message }));
+            """, message_input, message_to_send)
+            
+            time.sleep(1)
+            
+            sent = driver.execute_script("""
+                const sendButtons = document.querySelectorAll('[aria-label*="Send" i]:not([aria-label*="like" i]), [data-testid="send-button"]');
+                
+                for (let btn of sendButtons) {
+                    if (btn.offsetParent !== null) {
+                        btn.click();
+                        return 'button_clicked';
+                    }
+                }
+                return 'button_not_found';
+            """)
+            
+            if sent == 'button_not_found':
+                driver.execute_script("""
+                    const element = arguments[0];
+                    element.focus();
+                    
+                    const events = [
+                        new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }),
+                        new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }),
+                        new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true })
+                    ];
+                    
+                    events.forEach(event => element.dispatchEvent(event));
+                """, message_input)
+                log_message(task_id, f"{process_id}: ✅ Sent via Enter")
+            else:
+                log_message(task_id, f"{process_id}: ✅ Sent via button")
+            
+            task.messages_sent += 1
+            task.rotation_index += 1
+            task.last_active = datetime.now()
+            self.save_task(task)
+            
+            log_message(task_id, f"{process_id}: Message #{task.messages_sent} sent. Rotation index: {task.rotation_index}")
+            return True
+            
+        except Exception as send_error:
+            log_message(task_id, f"{process_id}: Send error: {str(send_error)[:100]}")
+            return False
+    
+    def _run_task(self, task_id: str):
+        task = self.tasks[task_id]
+        task.running = True
+        process_id = f"TASK-{task_id[-6:]}"
+        
+        driver = None
+        message_input = None
+        consecutive_failures = 0
+        
+        while task.status == "running" and not task.stop_flag:
+            try:
+                current_time = datetime.now()
+                last_restart = task.last_browser_restart
+                
+                if last_restart:
+                    hours_since_restart = (current_time - last_restart).total_seconds() / 3600
+                else:
+                    hours_since_restart = BROWSER_RESTART_HOURS + 1
+                
+                if hours_since_restart >= BROWSER_RESTART_HOURS or driver is None:
+                    log_message(task_id, f"{process_id}: 🔄 Browser restart - running for {hours_since_restart:.1f} hours...")
+                    log_message(task_id, f"{process_id}: 📍 Resuming from message #{task.messages_sent + 1} (rotation index: {task.rotation_index})")
+                    
+                    if driver:
+                        try:
+                            driver.quit()
+                        except:
+                            pass
+                        time.sleep(3)
+                    
+                    log_message(task_id, f"{process_id}: 🔪 Hard kill before browser restart...")
+                    hard_kill_all_chromium(task_id)
+                    time.sleep(2)
+                    
+                    log_message(task_id, f"{process_id}: Creating fresh browser session...")
+                    driver = self._setup_browser(task_id)
+                    
+                    message_input = self._login_and_navigate(driver, task, task_id, process_id)
+                    
+                    if not message_input:
+                        log_message(task_id, f"{process_id}: ❌ Failed to find message input! Retrying in 10 seconds...")
+                        driver = None
+                        time.sleep(10)
+                        continue
+                    
+                    task.last_browser_restart = datetime.now()
+                    self.save_task(task)
+                    
+                    log_message(task_id, f"{process_id}: ✅ Browser ready! Continuing from message #{task.messages_sent + 1} (rotation index: {task.rotation_index})")
+                    consecutive_failures = 0
+                    time.sleep(3)
+                
+                try:
+                    if message_input:
+                        message_input.is_enabled()
+                    else:
+                        raise Exception("Message input lost")
+                except:
+                    log_message(task_id, f"{process_id}: Message input lost, reconnecting...")
+                    message_input = self._login_and_navigate(driver, task, task_id, process_id)
+                    if not message_input:
+                        driver = None
+                        time.sleep(5)
+                        continue
+                
+                success = self._send_single_message(driver, message_input, task, task_id, process_id)
+                
+                if success:
+                    consecutive_failures = 0
+                    log_message(task_id, f"{process_id}: Waiting {task.delay}s for next message...")
+                    time.sleep(task.delay)
+                else:
+                    consecutive_failures += 1
+                    log_message(task_id, f"{process_id}: Send failed ({consecutive_failures}/3). Retrying...")
+                    
+                    if consecutive_failures >= 3:
+                        log_message(task_id, f"{process_id}: Too many failures, restarting browser...")
+                        driver = None
+                        consecutive_failures = 0
+                    time.sleep(10)
+                
+                if task.messages_sent % 50 == 0 and task.messages_sent > 0:
+                    try:
+                        driver.execute_script("localStorage.clear(); sessionStorage.clear();")
+                        gc.collect()
+                    except:
+                        pass
+                
+            except Exception as e:
+                log_message(task_id, f"{process_id}: Error: {str(e)[:100]}")
+                driver = None
+                time.sleep(10)
+        
+        if driver:
+            try:
+                driver.quit()
+                log_message(task_id, f"{process_id}: Browser closed")
+            except:
+                pass
+        
+        task.running = False
+        if task_id in self.task_threads:
+            del self.task_threads[task_id]
+
+# ==================== STREAMLIT UI ====================
+# Initialize session state
+if 'logged_in' not in st.session_state:
+    st.session_state.logged_in = False
+if 'username' not in st.session_state:
+    st.session_state.username = None
+if 'task_manager' not in st.session_state:
+    st.session_state.task_manager = None
+if 'selected_task' not in st.session_state:
+    st.session_state.selected_task = None
+if 'refresh_counter' not in st.session_state:
+    st.session_state.refresh_counter = 0
+
+# Lazy initialization of task manager (only once)
+if st.session_state.task_manager is None:
+    st.session_state.task_manager = TaskManager()
+
+task_manager = st.session_state.task_manager
+
+# Page config
 st.set_page_config(
-    page_title="R4J M1SHR4",
-    page_icon="🔥",
+    page_title="Facebook Message Bot",
+    page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-custom_css = """
+# Custom CSS
+st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600;700;800&display=swap');
-    
-    * {
-        font-family: 'Poppins', sans-serif;
-    }
-    
-    .stApp {
-        background: linear-gradient(135deg, #ffffff 0%, #ffe6f2 50%, #ffccff 100%);
-        background-size: cover;
-        background-position: center;
-        background-repeat: no-repeat;
-        background-attachment: fixed;
-    }
-    
-    .main .block-container {
-        background: rgba(255, 255, 255, 0.95);
-        backdrop-filter: blur(10px);
-        border-radius: 20px;
-        padding: 30px;
-        box-shadow: 0 8px 32px rgba(255, 105, 180, 0.2);
-        border: 2px solid rgba(255, 182, 193, 0.3);
-        margin-top: 20px;
-        margin-bottom: 20px;
-    }
-    
-    .main-header {
-        background: linear-gradient(135deg, #ff6b9d 0%, #ff1493 50%, #dc143c 100%);
-        padding: 3rem 2rem;
-        border-radius: 25px;
-        text-align: center;
-        margin-bottom: 3rem;
-        box-shadow: 0 15px 40px rgba(255, 20, 147, 0.3);
-        border: 3px solid rgba(255, 255, 255, 0.3);
-        position: relative;
-        overflow: hidden;
-    }
-    
-    .main-header::before {
-        content: '';
-        position: absolute;
-        top: 0;
-        left: 0;
-        right: 0;
-        bottom: 0;
-        background: linear-gradient(45deg, transparent 30%, rgba(255,255,255,0.1) 50%, transparent 70%);
-        animation: shine 3s infinite;
-    }
-    
-    @keyframes shine {
-        0% { transform: translateX(-100%); }
-        100% { transform: translateX(100%); }
-    }
-    
-    .main-header h1 {
+    .stButton button {
+        background-color: #667eea;
         color: white;
-        font-size: 3.5rem;
-        font-weight: 800;
-        margin: 0;
-        text-shadow: 3px 3px 10px rgba(0, 0, 0, 0.3);
-        letter-spacing: 1px;
-    }
-    
-    .main-header p {
-        color: rgba(255, 255, 255, 0.95);
-        font-size: 1.4rem;
-        font-weight: 600;
-        margin-top: 1rem;
-        text-shadow: 1px 1px 5px rgba(0, 0, 0, 0.2);
-    }
-    
-    .stButton>button {
-        background: linear-gradient(135deg, #ff6b9d 0%, #ff1493 100%);
-        color: white;
+        border-radius: 5px;
         border: none;
-        border-radius: 15px;
-        padding: 1rem 2.5rem;
-        font-weight: 700;
-        font-size: 1.1rem;
-        transition: all 0.3s ease;
-        box-shadow: 0 6px 20px rgba(255, 20, 147, 0.4);
-        width: 100%;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
+        padding: 0.5rem 1rem;
     }
-    
-    .stButton>button:hover {
-        transform: translateY(-3px);
-        box-shadow: 0 10px 25px rgba(255, 20, 147, 0.6);
-        background: linear-gradient(135deg, #ff1493 0%, #dc143c 100%);
+    .stButton button:hover {
+        background-color: #5a67d8;
     }
-    
-    .stTextInput>div>div>input, 
-    .stTextArea>div>div>textarea, 
-    .stNumberInput>div>div>input {
-        background: rgba(255, 255, 255, 0.9);
-        border: 2px solid #ffb6c1;
-        border-radius: 12px;
-        color: #333;
-        padding: 1rem;
-        font-weight: 500;
-        font-size: 1rem;
-        transition: all 0.3s ease;
-    }
-    
-    .stTextInput>div>div>input:focus, 
-    .stTextArea>div>div>textarea:focus {
-        background: rgba(255, 255, 255, 1);
-        border-color: #ff1493;
-        box-shadow: 0 0 0 3px rgba(255, 20, 147, 0.1);
-        color: #333;
-    }
-    
-    label {
-        color: #ff1493 !important;
-        font-weight: 700 !important;
-        font-size: 1rem !important;
-        margin-bottom: 8px !important;
-    }
-    
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 10px;
-        background: rgba(255, 182, 193, 0.2);
-        padding: 15px;
-        border-radius: 15px;
-        border: 2px solid rgba(255, 105, 180, 0.2);
-    }
-    
-    .stTabs [data-baseweb="tab"] {
-        background: rgba(255, 255, 255, 0.8);
-        border-radius: 12px;
-        color: #ff1493;
-        padding: 12px 25px;
-        font-weight: 600;
-        border: 2px solid transparent;
-        transition: all 0.3s ease;
-    }
-    
-    .stTabs [aria-selected="true"] {
-        background: linear-gradient(135deg, #ff6b9d 0%, #ff1493 100%);
-        color: white;
-        border-color: #ff1493;
-        box-shadow: 0 4px 15px rgba(255, 20, 147, 0.3);
-    }
-    
-    [data-testid="stMetricValue"] {
-        color: #ff1493;
-        font-weight: 800;
-        font-size: 2.2rem;
-        text-shadow: 1px 1px 3px rgba(0, 0, 0, 0.1);
-    }
-    
-    [data-testid="stMetricLabel"] {
-        color: #ff6b9d;
-        font-weight: 700;
-        font-size: 1rem;
-    }
-    
-    .metric-container {
-        background: rgba(255, 255, 255, 0.9);
-        padding: 20px;
-        border-radius: 15px;
-        border: 2px solid #ffb6c1;
-        box-shadow: 0 4px 15px rgba(255, 105, 180, 0.1);
-    }
-    
-    .console-section {
-        margin-top: 25px;
-        padding: 20px;
-        background: rgba(255, 255, 255, 0.95);
-        border-radius: 15px;
-        border: 2px solid #ff1493;
-        box-shadow: 0 4px 20px rgba(255, 20, 147, 0.1);
-    }
-    
-    .console-header {
-        color: #ff1493;
-        font-weight: 800;
-        font-size: 1.5rem;
-        margin-bottom: 20px;
-        text-align: center;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-    }
-    
-    .console-output {
-        background: #1a1a1a;
-        border: 2px solid #ff1493;
-        border-radius: 12px;
-        padding: 15px;
-        font-family: 'Courier New', 'Consolas', 'Monaco', monospace;
-        font-size: 13px;
-        color: #00ff88;
-        line-height: 1.7;
-        max-height: 500px;
-        overflow-y: auto;
-        scrollbar-width: thin;
-        scrollbar-color: #ff1493 #333;
-    }
-    
-    .console-output::-webkit-scrollbar {
-        width: 10px;
-    }
-    
-    .console-output::-webkit-scrollbar-track {
-        background: #333;
-        border-radius: 5px;
-    }
-    
-    .console-output::-webkit-scrollbar-thumb {
-        background: #ff1493;
-        border-radius: 5px;
-    }
-    
-    .console-output::-webkit-scrollbar-thumb:hover {
-        background: #ff6b9d;
-    }
-    
-    .console-line {
-        margin-bottom: 5px;
-        word-wrap: break-word;
-        padding: 8px 12px;
-        padding-left: 35px;
-        color: #00ff88;
-        background: rgba(255, 20, 147, 0.05);
-        border-left: 3px solid #ff1493;
-        position: relative;
-        border-radius: 5px;
-    }
-    
-    .console-line::before {
-        content: '▶';
-        position: absolute;
-        left: 12px;
-        color: #ff1493;
-        font-weight: bold;
-    }
-    
-    .success-box {
-        background: linear-gradient(135deg, #84fab0 0%, #8fd3f4 100%);
-        padding: 1.5rem;
-        border-radius: 15px;
-        color: white;
-        text-align: center;
-        margin: 1rem 0;
-        font-weight: 700;
-        font-size: 1.1rem;
-        border: 2px solid rgba(255, 255, 255, 0.3);
-    }
-    
-    .error-box {
-        background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);
-        padding: 1.5rem;
-        border-radius: 15px;
-        color: white;
-        text-align: center;
-        margin: 1rem 0;
-        font-weight: 700;
-        font-size: 1.1rem;
-        border: 2px solid rgba(255, 255, 255, 0.3);
-    }
-    
-    .info-card {
-        background: rgba(255, 255, 255, 0.95);
-        backdrop-filter: blur(10px);
-        padding: 2rem;
-        border-radius: 20px;
-        margin: 1.5rem 0;
-        border: 2px solid #ffb6c1;
-        box-shadow: 0 8px 25px rgba(255, 105, 180, 0.15);
-    }
-    
-    .footer {
-        text-align: center;
-        padding: 2.5rem;
-        color: #ff1493;
-        font-weight: 800;
-        font-size: 1.1rem;
-        margin-top: 4rem;
-        background: rgba(255, 255, 255, 0.9);
-        border-radius: 20px;
-        border-top: 3px solid #ff1493;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-    }
-    
-    [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #ffffff 0%, #ffe6f2 100%);
-        border-right: 3px solid #ff1493;
-    }
-    
-    [data-testid="stSidebar"] .element-container {
-        color: #ff1493;
-    }
-    
-    .sidebar-header {
-        background: linear-gradient(135deg, #ff6b9d 0%, #ff1493 100%);
-        padding: 2rem 1rem;
-        border-radius: 15px;
-        text-align: center;
-        margin-bottom: 2rem;
-        color: white;
-        font-weight: 800;
-        font-size: 1.3rem;
-        text-shadow: 1px 1px 3px rgba(0, 0, 0, 0.2);
-    }
-    
-    .brand-highlight {
-        background: linear-gradient(135deg, #ff6b9d 0%, #ff1493 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        background-clip: text;
-        font-weight: 800;
-    }
-    
-    .section-title {
-        color: #ff1493;
-        font-weight: 800;
-        font-size: 1.8rem;
-        margin-bottom: 1.5rem;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-        border-bottom: 3px solid #ffb6c1;
-        padding-bottom: 0.5rem;
-    }
-    
     .status-running {
-        color: #00ff00;
-        font-weight: 800;
-        text-shadow: 0 0 10px rgba(0, 255, 0, 0.5);
+        background-color: #d4edda;
+        color: #155724;
+        padding: 3px 10px;
+        border-radius: 3px;
+        font-weight: bold;
+        display: inline-block;
     }
-    
     .status-stopped {
-        color: #ff4444;
-        font-weight: 800;
+        background-color: #f8d7da;
+        color: #721c24;
+        padding: 3px 10px;
+        border-radius: 3px;
+        font-weight: bold;
+        display: inline-block;
+    }
+    .log-container {
+        background-color: #1e1e1e;
+        color: #d4d4d4;
+        border-radius: 5px;
+        padding: 15px;
+        font-family: 'Courier New', monospace;
+        font-size: 12px;
+        height: 400px;
+        overflow-y: auto;
+    }
+    .log-error {
+        color: #f48771;
+    }
+    .stat-card {
+        background: linear-gradient(135deg, #667eea, #764ba2);
+        border-radius: 10px;
+        padding: 20px;
+        text-align: center;
+        color: white;
+    }
+    .task-card {
+        background: #f8f9fa;
+        border-radius: 10px;
+        padding: 15px;
+        margin-bottom: 10px;
+        border-left: 4px solid #667eea;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    }
+    .task-card.running {
+        border-left-color: #28a745;
+    }
+    .task-card.stopped {
+        border-left-color: #dc3545;
+    }
+    .success-toast {
+        background-color: #28a745;
+        color: white;
+        padding: 10px;
+        border-radius: 5px;
+        margin-bottom: 10px;
+    }
+    .error-toast {
+        background-color: #dc3545;
+        color: white;
+        padding: 10px;
+        border-radius: 5px;
+        margin-bottom: 10px;
     }
 </style>
-"""
+""", unsafe_allow_html=True)
 
-st.markdown(custom_css, unsafe_allow_html=True)
-
-if 'logged_in' not in st.session_state:
-    st.session_state.logged_in = False
-if 'user_id' not in st.session_state:
-    st.session_state.user_id = None
-if 'username' not in st.session_state:
-    st.session_state.username = None
-if 'automation_running' not in st.session_state:
-    st.session_state.automation_running = False
-if 'logs' not in st.session_state:
-    st.session_state.logs = []
-if 'message_count' not in st.session_state:
-    st.session_state.message_count = 0
-if 'start_time' not in st.session_state:
-    st.session_state.start_time = None
-
-class AutomationState:
-    def __init__(self):
-        self.running = False
-        self.message_count = 0
-        self.logs = []
-        self.message_rotation_index = 0
-        self.start_time = None
-        self.last_browser_restart = None
-
-if 'automation_state' not in st.session_state:
-    st.session_state.automation_state = AutomationState()
-
-def log_message(msg, automation_state=None):
-    timestamp = time.strftime("%H:%M:%S")
-    formatted_msg = f"[{timestamp}] {msg}"
-    
-    if automation_state:
-        automation_state.logs.append(formatted_msg)
-    else:
-        if 'logs' in st.session_state:
-            st.session_state.logs.append(formatted_msg)
-
-def get_uptime(start_time):
-    """Calculate uptime string from start time"""
-    if not start_time:
-        return "Not started"
-    delta = datetime.now() - start_time
-    days = delta.days
-    hours = delta.seconds // 3600
-    minutes = (delta.seconds % 3600) // 60
-    seconds = delta.seconds % 60
-    if days > 0:
-        return f"{days}d {hours:02d}h {minutes:02d}m {seconds:02d}s"
-    return f"{hours:02d}h {minutes:02d}m {seconds:02d}s"
-
-def find_message_input(driver, process_id, automation_state=None):
-    log_message(f'{process_id}: Finding message input...', automation_state)
-    time.sleep(10)
-    
-    try:
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(2)
-        driver.execute_script("window.scrollTo(0, 0);")
-        time.sleep(2)
-    except Exception:
-        pass
-    
-    try:
-        page_title = driver.title
-        page_url = driver.current_url
-        log_message(f'{process_id}: Page Title: {page_title}', automation_state)
-        log_message(f'{process_id}: Page URL: {page_url}', automation_state)
-    except Exception as e:
-        log_message(f'{process_id}: Could not get page info: {e}', automation_state)
-    
-    message_input_selectors = [
-        'div[contenteditable="true"][role="textbox"]',
-        'div[contenteditable="true"][data-lexical-editor="true"]',
-        'div[aria-label*="message" i][contenteditable="true"]',
-        'div[aria-label*="Message" i][contenteditable="true"]',
-        'div[contenteditable="true"][spellcheck="true"]',
-        '[role="textbox"][contenteditable="true"]',
-        'textarea[placeholder*="message" i]',
-        'div[aria-placeholder*="message" i]',
-        'div[data-placeholder*="message" i]',
-        '[contenteditable="true"]',
-        'textarea',
-        'input[type="text"]'
-    ]
-    
-    log_message(f'{process_id}: Trying {len(message_input_selectors)} selectors...', automation_state)
-    
-    for idx, selector in enumerate(message_input_selectors):
-        try:
-            elements = driver.find_elements(By.CSS_SELECTOR, selector)
-            log_message(f'{process_id}: Selector {idx+1}/{len(message_input_selectors)} "{selector[:50]}..." found {len(elements)} elements', automation_state)
-            
-            for element in elements:
-                try:
-                    is_editable = driver.execute_script("""
-                        return arguments[0].contentEditable === 'true' || 
-                               arguments[0].tagName === 'TEXTAREA' || 
-                               arguments[0].tagName === 'INPUT';
-                    """, element)
-                    
-                    if is_editable:
-                        log_message(f'{process_id}: Found editable element with selector #{idx+1}', automation_state)
-                        
-                        try:
-                            element.click()
-                            time.sleep(0.5)
-                        except:
-                            pass
-                        
-                        element_text = driver.execute_script("return arguments[0].placeholder || arguments[0].getAttribute('aria-label') || arguments[0].getAttribute('aria-placeholder') || '';", element).lower()
-                        
-                        keywords = ['message', 'write', 'type', 'send', 'chat', 'msg', 'reply', 'text', 'aa']
-                        if any(keyword in element_text for keyword in keywords):
-                            log_message(f'{process_id}: ✅ Found message input with text: {element_text[:50]}', automation_state)
-                            return element
-                        elif idx < 10:
-                            log_message(f'{process_id}: ✅ Using primary selector editable element (#{idx+1})', automation_state)
-                            return element
-                        elif selector == '[contenteditable="true"]' or selector == 'textarea' or selector == 'input[type="text"]':
-                            log_message(f'{process_id}: ✅ Using fallback editable element', automation_state)
-                            return element
-                except Exception as e:
-                    log_message(f'{process_id}: Element check failed: {str(e)[:50]}', automation_state)
-                    continue
-        except Exception as e:
-            continue
-    
-    try:
-        page_source = driver.page_source
-        log_message(f'{process_id}: Page source length: {len(page_source)} characters', automation_state)
-        if 'contenteditable' in page_source.lower():
-            log_message(f'{process_id}: Page contains contenteditable elements', automation_state)
-        else:
-            log_message(f'{process_id}: No contenteditable elements found in page', automation_state)
-    except Exception:
-        pass
-    
-    return None
-
-def setup_browser(automation_state=None):
-    log_message('Setting up Chrome browser...', automation_state)
-    
-    chrome_options = Options()
-    chrome_options.add_argument('--headless=new')
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-setuid-sandbox')
-    chrome_options.add_argument('--disable-dev-shm-usage')
-    chrome_options.add_argument('--disable-gpu')
-    chrome_options.add_argument('--disable-extensions')
-    chrome_options.add_argument('--window-size=1920,1080')
-    chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36')
-    
-    chromium_paths = [
-        '/usr/bin/chromium',
-        '/usr/bin/chromium-browser',
-        '/usr/bin/google-chrome',
-        '/usr/bin/chrome'
-    ]
-    
-    for chromium_path in chromium_paths:
-        if Path(chromium_path).exists():
-            chrome_options.binary_location = chromium_path
-            log_message(f'Found Chromium at: {chromium_path}', automation_state)
-            break
-    
-    chromedriver_paths = [
-        '/usr/bin/chromedriver',
-        '/usr/local/bin/chromedriver'
-    ]
-    
-    driver_path = None
-    for driver_candidate in chromedriver_paths:
-        if Path(driver_candidate).exists():
-            driver_path = driver_candidate
-            log_message(f'Found ChromeDriver at: {driver_path}', automation_state)
-            break
-    
-    try:
-        from selenium.webdriver.chrome.service import Service
-        
-        if driver_path:
-            service = Service(executable_path=driver_path)
-            driver = webdriver.Chrome(service=service, options=chrome_options)
-            log_message('Chrome started with detected ChromeDriver!', automation_state)
-        else:
-            driver = webdriver.Chrome(options=chrome_options)
-            log_message('Chrome started with default driver!', automation_state)
-        
-        driver.set_window_size(1920, 1080)
-        log_message('Chrome browser setup completed successfully!', automation_state)
-        return driver
-    except Exception as error:
-        log_message(f'Browser setup failed: {error}', automation_state)
-        raise error
-
-def get_next_message(messages, automation_state=None):
-    if not messages or len(messages) == 0:
-        return 'Hello!'
-    
-    if automation_state:
-        message = messages[automation_state.message_rotation_index % len(messages)]
-        automation_state.message_rotation_index += 1
-    else:
-        message = messages[0]
-    
-    return message
-
-def send_messages(config, automation_state, user_id, process_id='AUTO-1'):
-    driver = None
-    try:
-        log_message(f'{process_id}: Starting automation...', automation_state)
-        
-        if automation_state.start_time is None:
-            automation_state.start_time = datetime.now()
-            log_message(f'{process_id}: Automation started at: {automation_state.start_time.strftime("%Y-%m-%d %H:%M:%S")}', automation_state)
-        
-        if automation_state.last_browser_restart is None:
-            automation_state.last_browser_restart = datetime.now()
-        
-        driver = setup_browser(automation_state)
-        
-        log_message(f'{process_id}: Navigating to Facebook...', automation_state)
-        driver.get('https://www.facebook.com/')
-        time.sleep(8)
-        
-        if config['cookies'] and config['cookies'].strip():
-            log_message(f'{process_id}: Adding cookies...', automation_state)
-            cookie_array = config['cookies'].split(';')
-            for cookie in cookie_array:
-                cookie_trimmed = cookie.strip()
-                if cookie_trimmed:
-                    first_equal_index = cookie_trimmed.find('=')
-                    if first_equal_index > 0:
-                        name = cookie_trimmed[:first_equal_index].strip()
-                        value = cookie_trimmed[first_equal_index + 1:].strip()
-                        try:
-                            driver.add_cookie({
-                                'name': name,
-                                'value': value,
-                                'domain': '.facebook.com',
-                                'path': '/'
-                            })
-                        except Exception:
-                            pass
-        
-        if config['chat_id']:
-            chat_id = config['chat_id'].strip()
-            log_message(f'{process_id}: Opening conversation {chat_id}...', automation_state)
-            driver.get(f'https://www.facebook.com/messages/t/{chat_id}')
-        else:
-            log_message(f'{process_id}: Opening messages...', automation_state)
-            driver.get('https://www.facebook.com/messages')
-        
-        time.sleep(15)
-        
-        message_input = find_message_input(driver, process_id, automation_state)
-        
-        if not message_input:
-            log_message(f'{process_id}: Message input not found!', automation_state)
-            automation_state.running = False
-            db.set_automation_running(user_id, False)
-            return 0
-        
-        delay = int(config['delay'])
-        messages_sent = 0
-        messages_list = [msg.strip() for msg in config['messages'].split('\n') if msg.strip()]
-        
-        if not messages_list:
-            messages_list = ['Hello!']
-        
-        while automation_state.running:
-            current_time = datetime.now()
-            if automation_state.last_browser_restart:
-                hours_since_restart = (current_time - automation_state.last_browser_restart).total_seconds() / 3600
-            else:
-                hours_since_restart = 11
-            
-            if hours_since_restart >= 10:
-                log_message(f'{process_id}: 🔄 Browser restarting after {hours_since_restart:.1f} hours...', automation_state)
-                log_message(f'{process_id}: 📍 Resuming from message #{messages_sent + 1} (rotation index: {automation_state.message_rotation_index})', automation_state)
-                
-                if driver:
-                    try:
-                        driver.quit()
-                        log_message(f'{process_id}: Old browser closed', automation_state)
-                    except:
-                        pass
-                    time.sleep(5)
-                
-                driver = setup_browser(automation_state)
-                
-                log_message(f'{process_id}: Navigating to Facebook...', automation_state)
-                driver.get('https://www.facebook.com/')
-                time.sleep(8)
-                
-                if config['cookies'] and config['cookies'].strip():
-                    cookie_array = config['cookies'].split(';')
-                    for cookie in cookie_array:
-                        cookie_trimmed = cookie.strip()
-                        if cookie_trimmed:
-                            first_equal_index = cookie_trimmed.find('=')
-                            if first_equal_index > 0:
-                                name = cookie_trimmed[:first_equal_index].strip()
-                                value = cookie_trimmed[first_equal_index + 1:].strip()
-                                try:
-                                    driver.add_cookie({
-                                        'name': name,
-                                        'value': value,
-                                        'domain': '.facebook.com',
-                                        'path': '/'
-                                    })
-                                except Exception:
-                                    pass
-                
-                if config['chat_id']:
-                    chat_id = config['chat_id'].strip()
-                    driver.get(f'https://www.facebook.com/messages/t/{chat_id}')
-                else:
-                    driver.get('https://www.facebook.com/messages')
-                
-                time.sleep(12)
-                
-                message_input = find_message_input(driver, process_id, automation_state)
-                
-                if not message_input:
-                    log_message(f'{process_id}: ❌ Message input not found after restart!', automation_state)
-                    automation_state.running = False
-                    db.set_automation_running(user_id, False)
-                    return messages_sent
-                
-                automation_state.last_browser_restart = datetime.now()
-                log_message(f'{process_id}: ✅ Browser restarted successfully!', automation_state)
-                time.sleep(3)
-            
-            try:
-                if message_input:
-                    message_input.is_enabled()
-                else:
-                    raise Exception("Message input lost")
-            except:
-                log_message(f'{process_id}: Message input lost, reconnecting...', automation_state)
-                message_input = find_message_input(driver, process_id, automation_state)
-                if not message_input:
-                    driver = None
-                    time.sleep(5)
-                    continue
-            
-            base_message = get_next_message(messages_list, automation_state)
-            
-            if config['name_prefix']:
-                message_to_send = f"{config['name_prefix']} {base_message}"
-            else:
-                message_to_send = base_message
-            
-            try:
-                driver.execute_script("""
-                    const element = arguments[0];
-                    const message = arguments[1];
-                    
-                    element.scrollIntoView({behavior: 'smooth', block: 'center'});
-                    element.focus();
-                    element.click();
-                    
-                    if (element.tagName === 'DIV') {
-                        element.textContent = message;
-                        element.innerHTML = message;
-                    } else {
-                        element.value = message;
-                    }
-                    
-                    element.dispatchEvent(new Event('input', { bubbles: true }));
-                    element.dispatchEvent(new Event('change', { bubbles: true }));
-                    element.dispatchEvent(new InputEvent('input', { bubbles: true, data: message }));
-                """, message_input, message_to_send)
-                
-                time.sleep(1)
-                
-                sent = driver.execute_script("""
-                    const sendButtons = document.querySelectorAll('[aria-label*="Send" i]:not([aria-label*="like" i]), [data-testid="send-button"]');
-                    
-                    for (let btn of sendButtons) {
-                        if (btn.offsetParent !== null) {
-                            btn.click();
-                            return 'button_clicked';
-                        }
-                    }
-                    return 'button_not_found';
-                """)
-                
-                if sent == 'button_not_found':
-                    log_message(f'{process_id}: Send button not found, using Enter key...', automation_state)
-                    driver.execute_script("""
-                        const element = arguments[0];
-                        element.focus();
-                        
-                        const events = [
-                            new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }),
-                            new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }),
-                            new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true })
-                        ];
-                        
-                        events.forEach(event => element.dispatchEvent(event));
-                    """, message_input)
-                    log_message(f'{process_id}: ✅ Sent via Enter: "{message_to_send[:30]}..."', automation_state)
-                else:
-                    log_message(f'{process_id}: ✅ Sent via button: "{message_to_send[:30]}..."', automation_state)
-                
-                messages_sent += 1
-                automation_state.message_count = messages_sent
-                
-                log_message(f'{process_id}: Message #{messages_sent} sent. Waiting {delay}s...', automation_state)
-                time.sleep(delay)
-                
-            except Exception as e:
-                log_message(f'{process_id}: Send error: {str(e)[:100]}', automation_state)
-                time.sleep(5)
-        
-        log_message(f'{process_id}: Automation stopped. Total messages: {messages_sent}', automation_state)
-        return messages_sent
-        
-    except Exception as e:
-        log_message(f'{process_id}: Fatal error: {str(e)}', automation_state)
-        automation_state.running = False
-        db.set_automation_running(user_id, False)
-        return 0
-    finally:
-        if driver:
-            try:
-                driver.quit()
-                log_message(f'{process_id}: Browser closed', automation_state)
-            except:
-                pass
-
-def run_automation(user_config, automation_state, user_id):
-    send_messages(user_config, automation_state, user_id)
-
-def start_automation(user_config, user_id):
-    automation_state = st.session_state.automation_state
-    
-    if automation_state.running:
-        return
-    
-    automation_state.running = True
-    automation_state.message_count = 0
-    automation_state.logs = []
-    automation_state.start_time = datetime.now()
-    automation_state.last_browser_restart = datetime.now()
-    
-    db.set_automation_running(user_id, True)
-    
-    username = db.get_username(user_id)
-    thread = threading.Thread(target=run_automation, args=(user_config, automation_state, user_id))
-    thread.daemon = True
-    thread.start()
-
-def stop_automation(user_id):
-    st.session_state.automation_state.running = False
-    db.set_automation_running(user_id, False)
-
+# ==================== LOGIN PAGE ====================
 def login_page():
     st.markdown("""
-    <div class="main-header">
-        <h1>🔥 R4J M1SHR4 🔥</h1>
-        <p>PREMIUM FACEBOOK MESSAGE AUTOMATION TOOL</p>
-    </div>
+        <div style="text-align: center; padding: 50px;">
+            <h1>🤖 Facebook Message Bot</h1>
+            <p>Automated messaging system with browser restart and resume capabilities</p>
+            <p>🔄 Browser restart every 3 hours | 🔪 Hard kill | 🔄 Auto-resume</p>
+        </div>
     """, unsafe_allow_html=True)
     
-    tab1, tab2 = st.tabs(["🔐 LOGIN", "✨ SIGN UP"])
-    
-    with tab1:
-        st.markdown("### WELCOME BACK!")
-        username = st.text_input("USERNAME", key="login_username", placeholder="Enter your username")
-        password = st.text_input("PASSWORD", key="login_password", type="password", placeholder="Enter your password")
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.markdown("### Login")
+        username = st.text_input("Username", key="login_username")
+        password = st.text_input("Password", type="password", key="login_password")
         
-        if st.button("LOGIN", key="login_btn", use_container_width=True):
-            if username and password:
-                user_id = db.verify_user(username, password)
-                if user_id:
-                    st.session_state.logged_in = True
-                    st.session_state.user_id = user_id
-                    st.session_state.username = username
-                    
-                    # REMOVED: Auto-start automation on login
-                    # User will manually start automation
-                    
-                    st.success(f"✅ WELCOME BACK, {username.upper()}!")
-                    st.rerun()
-                else:
-                    st.error("❌ INVALID USERNAME OR PASSWORD!")
+        if st.button("Login", use_container_width=True):
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            password_hash = hashlib.sha256(password.encode()).hexdigest()
+            cursor.execute('SELECT * FROM users WHERE username = ? AND password_hash = ?', 
+                          (username, password_hash))
+            user = cursor.fetchone()
+            conn.close()
+            
+            if user:
+                st.session_state.logged_in = True
+                st.session_state.username = username
+                st.rerun()
             else:
-                st.warning("⚠️ PLEASE ENTER BOTH USERNAME AND PASSWORD")
-    
-    with tab2:
-        st.markdown("### CREATE NEW ACCOUNT")
-        new_username = st.text_input("CHOOSE USERNAME", key="signup_username", placeholder="Choose a unique username")
-        new_password = st.text_input("CHOOSE PASSWORD", key="signup_password", type="password", placeholder="Create a strong password")
-        confirm_password = st.text_input("CONFIRM PASSWORD", key="confirm_password", type="password", placeholder="Re-enter your password")
+                st.error("Invalid credentials! Default: admin / admin123")
         
-        if st.button("CREATE ACCOUNT", key="signup_btn", use_container_width=True):
-            if new_username and new_password and confirm_password:
-                if new_password == confirm_password:
-                    success, message = db.create_user(new_username, new_password)
-                    if success:
-                        st.success(f"✅ {message} PLEASE LOGIN NOW!")
-                    else:
-                        st.error(f"❌ {message}")
-                else:
-                    st.error("❌ PASSWORDS DO NOT MATCH!")
-            else:
-                st.warning("⚠️ PLEASE FILL ALL FIELDS")
+        st.info("Default login: **admin** / **admin123**")
+        st.caption("💾 Data persists across sessions | 🔄 Browser auto-restart every 3 hours")
 
-def main_app():
-    st.markdown("""
-    <div class="main-header">
-        <h1>🔥 R4J M1SHR4 🔥</h1>
-        <p>PREMIUM FACEBOOK MESSAGE AUTOMATION TOOL</p>
-    </div>
-    """, unsafe_allow_html=True)
+# ==================== MAIN DASHBOARD ====================
+def dashboard():
+    # Header
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        st.title("🤖 Facebook Message Bot")
+        st.caption(f"Logged in as: {st.session_state.username}")
+    with col3:
+        if st.button("🚪 Logout", use_container_width=True):
+            st.session_state.logged_in = False
+            st.session_state.username = None
+            st.session_state.selected_task = None
+            st.rerun()
     
-    st.sidebar.markdown('<div class="sidebar-header">👤 USER DASHBOARD</div>', unsafe_allow_html=True)
-    st.sidebar.markdown(f"**USERNAME:** {st.session_state.username}")
-    st.sidebar.markdown(f"**USER ID:** {st.session_state.user_id}")
-    st.sidebar.markdown('<div class="success-box">✅ PREMIUM ACCESS</div>', unsafe_allow_html=True)
+    # Manual Refresh Button
+    col_refresh, col_empty = st.columns([1, 5])
+    with col_refresh:
+        if st.button("🔄 Refresh Data", use_container_width=True):
+            st.session_state.refresh_counter += 1
+            st.rerun()
     
-    if st.sidebar.button("🚪 LOGOUT", use_container_width=True):
-        if st.session_state.automation_state.running:
-            stop_automation(st.session_state.user_id)
+    # Stats row
+    tasks = list(task_manager.tasks.values())
+    user_tasks = [t for t in tasks if t.username == st.session_state.username]
+    
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.markdown(f"""
+            <div class="stat-card">
+                <h3>Total Tasks</h3>
+                <h2>{len(user_tasks)}</h2>
+            </div>
+        """, unsafe_allow_html=True)
+    with col2:
+        st.markdown(f"""
+            <div class="stat-card">
+                <h3>Running Tasks</h3>
+                <h2>{sum(1 for t in user_tasks if t.status == 'running')}</h2>
+            </div>
+        """, unsafe_allow_html=True)
+    with col3:
+        st.markdown(f"""
+            <div class="stat-card">
+                <h3>Stopped Tasks</h3>
+                <h2>{sum(1 for t in user_tasks if t.status == 'stopped')}</h2>
+            </div>
+        """, unsafe_allow_html=True)
+    with col4:
+        st.markdown(f"""
+            <div class="stat-card">
+                <h3>Total Messages</h3>
+                <h2>{sum(t.messages_sent for t in user_tasks)}</h2>
+            </div>
+        """, unsafe_allow_html=True)
+    
+    # Success/Error message placeholder
+    if 'action_message' in st.session_state:
+        if st.session_state.action_message_type == 'success':
+            st.success(st.session_state.action_message)
+        elif st.session_state.action_message_type == 'error':
+            st.error(st.session_state.action_message)
+        del st.session_state.action_message
+        del st.session_state.action_message_type
+    
+    # Main content
+    col_left, col_right = st.columns([1, 1])
+    
+    with col_left:
+        st.markdown("### ➕ Create New Task")
+        with st.form("create_task_form"):
+            chat_id = st.text_input("Chat Thread ID", placeholder="e.g., 1362400298935018", 
+                                   help="Facebook chat thread ID from URL")
+            name_prefix = st.text_input("Name Prefix (optional)", placeholder="e.g., John",
+                                       help="Added before each message")
+            messages = st.text_area("Messages (one per line)", 
+                                   placeholder="Hello!\nHow are you?\nNice to meet you!", 
+                                   height=120,
+                                   help="Each line becomes a message in rotation")
+            delay = st.number_input("Delay (seconds)", min_value=10, value=30, step=5,
+                                   help="Time between messages")
+            cookies = st.text_area("Facebook Cookies", 
+                                  placeholder="c_user=1234567890; xs=789012%3Aabc123; datr=abc123",
+                                  height=80,
+                                  help="Copy cookies from browser after login")
+            
+            submitted = st.form_submit_button("🚀 Create & Start Task", use_container_width=True)
+            if submitted:
+                if not chat_id or not messages or not cookies:
+                    st.error("Please fill all required fields!")
+                else:
+                    try:
+                        task_id = f"task_{random.randint(10000, 99999)}"
+                        messages_list = [m.strip() for m in messages.split('\n') if m.strip()]
+                        
+                        if not messages_list:
+                            st.error("Please enter at least one message!")
+                        else:
+                            task = Task(
+                                task_id=task_id,
+                                username=st.session_state.username,
+                                cookies=[cookies],
+                                chat_id=chat_id,
+                                name_prefix=name_prefix,
+                                messages=messages_list,
+                                delay=delay,
+                                status='stopped',
+                                messages_sent=0,
+                                start_time=None,
+                                last_active=None,
+                                last_browser_restart=None,
+                                rotation_index=0
+                            )
+                            
+                            task_manager.tasks[task_id] = task
+                            task_manager.save_task(task)
+                            task_manager.start_task(task_id)
+                            
+                            st.session_state.action_message = f"✅ Task {task_id} created and started successfully!"
+                            st.session_state.action_message_type = 'success'
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {str(e)}")
+    
+    with col_right:
+        st.markdown("### 📋 Your Tasks")
         
-        st.session_state.logged_in = False
-        st.session_state.user_id = None
-        st.session_state.username = None
-        st.session_state.automation_running = False
-        st.rerun()
+        if not user_tasks:
+            st.info("No tasks created yet. Create your first task on the left!")
+        else:
+            for task in user_tasks:
+                with st.container():
+                    status_class = "running" if task.status == "running" else "stopped"
+                    st.markdown(f"""
+                        <div class="task-card {status_class}">
+                            <div style="display: flex; justify-content: space-between; align-items: center;">
+                                <strong>📌 {task.task_id}</strong>
+                                <span class="status-{status_class}">{task.status.upper()}</span>
+                            </div>
+                            <div style="font-size: 12px; color: #666; margin-top: 10px;">
+                                💬 Chat: {task.chat_id[:20]}{'...' if len(task.chat_id) > 20 else ''} | 
+                                📨 Sent: {task.messages_sent} msgs | 
+                                ⏱️ Uptime: {task.get_uptime()} | 
+                                ⏲️ Delay: {task.delay}s
+                            </div>
+                        </div>
+                    """, unsafe_allow_html=True)
+                    
+                    col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1])
+                    with col_btn1:
+                        if task.status == 'running':
+                            if st.button(f"⏸ Stop", key=f"stop_{task.task_id}", use_container_width=True):
+                                task_manager.stop_task(task.task_id)
+                                st.session_state.action_message = f"⏸ Task {task.task_id} stopped"
+                                st.session_state.action_message_type = 'success'
+                                st.rerun()
+                        else:
+                            if st.button(f"▶ Start", key=f"start_{task.task_id}", use_container_width=True):
+                                task_manager.start_task(task.task_id)
+                                st.session_state.action_message = f"▶ Task {task.task_id} started"
+                                st.session_state.action_message_type = 'success'
+                                st.rerun()
+                    with col_btn2:
+                        if st.button(f"📄 Logs", key=f"logs_{task.task_id}", use_container_width=True):
+                            st.session_state.selected_task = task.task_id
+                            st.session_state.action_message = f"📄 Showing logs for {task.task_id}"
+                            st.session_state.action_message_type = 'success'
+                            st.rerun()
+                    with col_btn3:
+                        if st.button(f"🗑 Delete", key=f"delete_{task.task_id}", use_container_width=True):
+                            if task_manager.delete_task(task.task_id):
+                                if st.session_state.selected_task == task.task_id:
+                                    st.session_state.selected_task = None
+                                st.session_state.action_message = f"🗑 Task {task.task_id} deleted"
+                                st.session_state.action_message_type = 'success'
+                                st.rerun()
+                    
+                    st.divider()
     
-    user_config = db.get_user_config(st.session_state.user_id)
+    # Logs section
+    st.markdown("### 📄 Task Logs")
     
-    if user_config:
-        tab1, tab2 = st.tabs(["⚙️ CONFIGURATION", "🚀 AUTOMATION"])
+    if st.session_state.selected_task and st.session_state.selected_task in task_manager.tasks:
+        selected_task_id = st.session_state.selected_task
+        logs = list(st.session_state.get('task_logs', {}).get(selected_task_id, []))
         
-        with tab1:
-            st.markdown('<div class="section-title">⚙️ CONFIGURATION SETTINGS</div>', unsafe_allow_html=True)
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                chat_id = st.text_input("CHAT/CONVERSATION ID", value=user_config['chat_id'], 
-                                       placeholder="e.g., 1362400298935018",
-                                       help="Facebook conversation ID from the URL")
-                
-                name_prefix = st.text_input("NAME PREFIX", value=user_config['name_prefix'],
-                                           placeholder="e.g., [R4J M1SHR4]",
-                                           help="Prefix to add before each message")
-                
-                delay = st.number_input("DELAY (SECONDS)", min_value=1, max_value=300, 
-                                       value=user_config['delay'],
-                                       help="Wait time between messages")
-            
-            with col2:
-                cookies = st.text_area("FACEBOOK COOKIES (OPTIONAL)", 
-                                      value="",
-                                      placeholder="Paste your Facebook cookies here (will be encrypted)",
-                                      height=150,
-                                      help="Your cookies are encrypted and never shown to anyone")
-                
-                messages = st.text_area("MESSAGES (ONE PER LINE)", 
-                                       value=user_config['messages'],
-                                       placeholder="Enter your messages here, one per line",
-                                       height=200,
-                                       help="Enter each message on a new line")
-            
-            if st.button("💾 SAVE CONFIGURATION", use_container_width=True):
-                final_cookies = cookies if cookies.strip() else user_config['cookies']
-                db.update_user_config(
-                    st.session_state.user_id,
-                    chat_id,
-                    name_prefix,
-                    delay,
-                    final_cookies,
-                    messages
-                )
-                st.success("✅ CONFIGURATION SAVED SUCCESSFULLY!")
+        col_refresh_logs, col_clear_logs = st.columns([1, 1])
+        with col_refresh_logs:
+            if st.button("🔄 Refresh Logs", use_container_width=True):
+                st.rerun()
+        with col_clear_logs:
+            if st.button("🗑 Clear Logs", use_container_width=True):
+                if selected_task_id in st.session_state.task_logs:
+                    st.session_state.task_logs[selected_task_id].clear()
                 st.rerun()
         
-        with tab2:
-            st.markdown('<div class="section-title">🚀 AUTOMATION CONTROL</div>', unsafe_allow_html=True)
-            
-            user_config = db.get_user_config(st.session_state.user_id)
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.markdown('<div class="metric-container">', unsafe_allow_html=True)
-                st.metric("MESSAGES SENT", st.session_state.automation_state.message_count)
-                st.markdown('</div>', unsafe_allow_html=True)
-            
-            with col2:
-                st.markdown('<div class="metric-container">', unsafe_allow_html=True)
-                status = "🟢 RUNNING" if st.session_state.automation_state.running else "🔴 STOPPED"
-                st.metric("STATUS", status)
-                st.markdown('</div>', unsafe_allow_html=True)
-            
-            with col3:
-                st.markdown('<div class="metric-container">', unsafe_allow_html=True)
-                uptime = get_uptime(st.session_state.automation_state.start_time)
-                st.metric("TASK UPTIME", uptime)
-                st.markdown('</div>', unsafe_allow_html=True)
-            
-            st.markdown("---")
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                if st.button("▶️ START AUTOMATION", disabled=st.session_state.automation_state.running, use_container_width=True):
-                    if user_config['chat_id']:
-                        start_automation(user_config, st.session_state.user_id)
-                        st.success("✅ AUTOMATION STARTED!")
-                        st.rerun()
-                    else:
-                        st.error("❌ PLEASE SET CHAT ID IN CONFIGURATION FIRST!")
-            
-            with col2:
-                if st.button("⏹️ STOP AUTOMATION", disabled=not st.session_state.automation_state.running, use_container_width=True):
-                    stop_automation(st.session_state.user_id)
-                    st.warning("⚠️ AUTOMATION STOPPED!")
-                    st.rerun()
-            
-            if st.session_state.automation_state.logs:
-                st.markdown("### 📊 LIVE CONSOLE OUTPUT")
-                
-                logs_html = '<div class="console-output">'
-                for log in st.session_state.automation_state.logs[-50:]:
-                    logs_html += f'<div class="console-line">{log}</div>'
-                logs_html += '</div>'
-                
-                st.markdown(logs_html, unsafe_allow_html=True)
-                
-                if st.button("🔄 REFRESH LOGS", use_container_width=True):
-                    st.rerun()
+        if logs:
+            log_html = '<div class="log-container">'
+            for log in logs[-100:]:  # Last 100 logs
+                is_error = 'ERROR' in log or 'Fatal' in log or '❌' in log
+                log_class = 'log-error' if is_error else ''
+                log_html += f'<div class="{log_class}">{log}</div>'
+            log_html += '</div>'
+            st.markdown(log_html, unsafe_allow_html=True)
+            st.caption(f"📊 Showing last {len(logs[-100:])} logs | Total logs: {len(logs)}")
+        else:
+            st.info("No logs available for this task yet. Wait for task activity...")
     else:
-        st.warning("⚠️ NO CONFIGURATION FOUND. PLEASE REFRESH THE PAGE!")
+        st.info("👈 Select a task's 'Logs' button to view its activity logs")
+    
+    # Footer with info
+    st.divider()
+    st.caption(f"""
+    🔧 **System Info:**
+    - 🔄 Browser Restart: Every {BROWSER_RESTART_HOURS} hours
+    - 🔪 Hard kill: On Task Start & Browser Restart
+    - 🔄 Auto-resume: Task crash par auto restart
+    - 💾 Messages resume from exact rotation index after restart
+    - ⏱️ Original timing: 8s, 5s, 12s waits
+    - 📊 Refresh manually using 'Refresh Data' button
+    """)
 
+# ==================== RUN APP ====================
 if not st.session_state.logged_in:
     login_page()
 else:
-    main_app()
-
-st.markdown('<div class="footer">MADE WITH ❤️ BY R4J M1SHR4 | © 2025</div>', unsafe_allow_html=True)
+    dashboard()
